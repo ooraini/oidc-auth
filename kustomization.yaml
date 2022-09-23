@@ -11,4 +11,4 @@ commonLabels:
 images:
 - name: oidc-auth
   newName: ghcr.io/ooraini/oidc-auth
-  newTag: v0.0.2
+  newTag: v0.2.0

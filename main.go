@@ -5,25 +5,23 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
-	"encoding/hex"
 	"github.com/coreos/go-oidc/v3/oidc"
-	"golang.org/x/crypto/nacl/secretbox"
 	"golang.org/x/oauth2"
-	"io"
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
 
 const prefix = "/auth"
+const SessionCookieName = "oidc_auth"
 
 var (
 	provider *oidc.Provider
 	config   oauth2.Config
 	verifier *oidc.IDTokenVerifier
-	secret   [32]byte
 )
 
 func getEnvOrDie(key string) string {
@@ -50,13 +48,6 @@ func main() {
 	}
 	var err error
 	issuer := getEnvOrDie("ISSUER")
-
-	secretBytes, err := hex.DecodeString(getEnvOrDie("COOKIE_SECRET"))
-	copy(secret[:], secretBytes)
-
-	if err != nil {
-		log.Fatalln("unable to decode cookie secret", err)
-	}
 
 	if getEnvOrDefault("INSECURE_SKIP_VERIFY", "false") == "true" {
 		t := &http.Transport{
@@ -85,7 +76,7 @@ func main() {
 	http.HandleFunc(prefix+"/login", login)
 	http.HandleFunc(prefix+"/logout", logout)
 	http.HandleFunc(prefix+"/callback", callback)
-	http.HandleFunc(prefix+"/decide", decide)
+	http.HandleFunc(prefix+"/decisions", decide)
 	http.HandleFunc("/", http.NotFound)
 	err = http.ListenAndServe(":"+getEnvOrDefault("PORT", "8080"), nil)
 	if err != nil {
@@ -94,53 +85,39 @@ func main() {
 }
 
 func logout(rw http.ResponseWriter, req *http.Request) {
-	clearCookie(rw, "oidc-auth")
+	clearCookie(rw, SessionCookieName)
+	infoS(req, "clearing session", http.StatusFound)
 	http.Redirect(rw, req, "/", http.StatusFound)
 }
 
+func info(req *http.Request, message string) {
+	log.Printf("%s - %s %s %s\n", req.RemoteAddr, req.Method, req.URL.Path, message)
+}
+
+func infoS(req *http.Request, message string, status int) {
+	log.Printf("%s - %s %s %s - %s\n", req.RemoteAddr, req.Method, req.URL.Path, message, http.StatusText(status))
+}
+
 func decide(rw http.ResponseWriter, req *http.Request) {
-	sessionCookie, err := req.Cookie("oidc-auth")
-
+	sessionCookie, err := req.Cookie(SessionCookieName)
 	if err != nil {
-		log.Println("decide: no session cookie")
+		infoS(req, "no session cookie", http.StatusUnauthorized)
 		rw.WriteHeader(http.StatusUnauthorized)
 		return
 	}
 
-	encoded := []byte(sessionCookie.Value)
-
-	encrypted := make([]byte, base64.URLEncoding.DecodedLen(len(encoded)))
-	_, err = base64.URLEncoding.Decode(encrypted, encoded)
-
-	if err != nil {
-		log.Println("decide: invalid session cookie", err)
-		clearCookie(rw, "oidc-auth")
-		rw.WriteHeader(http.StatusUnauthorized)
-		return
-	}
-
-	var decryptNonce [24]byte
-	copy(decryptNonce[:], encrypted[:24])
-	decrypted, ok := secretbox.Open(nil, encrypted[24:], &decryptNonce, &secret)
-	if !ok {
-		log.Println("decide: unable to decrypt session cookie")
-		clearCookie(rw, "oidc-auth")
-		rw.WriteHeader(http.StatusUnauthorized)
-		return
-	}
-
-	rawIdToken := string(decrypted)
+	rawIdToken := sessionCookie.Value
 	idToken, err := verifier.Verify(req.Context(), rawIdToken)
 	if err != nil {
-		log.Println("decide: invalid token", err)
-		clearCookie(rw, "oidc-auth")
+		infoS(req, "verify failed : "+err.Error(), http.StatusUnauthorized)
+		clearCookie(rw, SessionCookieName)
 		rw.WriteHeader(http.StatusUnauthorized)
 		return
 	}
 
 	var claims map[string]interface{}
 	if err = idToken.Claims(&claims); err != nil {
-		log.Println("decide: no claims", err)
+		infoS(req, "no claims in token", http.StatusInternalServerError)
 		rw.WriteHeader(http.StatusInternalServerError)
 		return
 	}
@@ -151,54 +128,83 @@ func decide(rw http.ResponseWriter, req *http.Request) {
 	preferredUsernameClaim := claims["preferred_username"]
 	groupsClaim := claims["groups"]
 
-	rw.Header().Set("X-Forwarded-Subject", subClaim.(string))
+	rw.Header().Set("X-Auth-Request-Subject", subClaim.(string))
 
 	if name, ok := nameClaim.(string); ok {
-		rw.Header().Set("X-Forwarded-User", name)
+		rw.Header().Set("X-Auth-Request-User", name)
 	}
 
+	userEmail := ""
 	if email, ok := emailClaim.(string); ok {
-		rw.Header().Set("X-Forwarded-Email", email)
+		userEmail = email
+		rw.Header().Set("X-Auth-Request-Email", email)
 	}
 
 	if preferredUsername, ok := preferredUsernameClaim.(string); ok {
-		rw.Header().Set("X-Forwarded-Preferred-Username", preferredUsername)
+		rw.Header().Set("X-Auth-Request-Preferred-Username", preferredUsername)
 	}
 
+	var userGroups []string
 	if groups, ok := groupsClaim.([]interface{}); ok {
-		var stringGroups []string
 		for _, group := range groups {
 			if g, ok := group.(string); ok {
-				stringGroups = append(stringGroups, g)
+				userGroups = append(userGroups, g)
 			}
 		}
-		rw.Header().Set("X-Forwarded-Groups", strings.Join(stringGroups, ","))
+		rw.Header().Set("X-Auth-Request-Groups", strings.Join(userGroups, ","))
 	}
 
 	rw.Header().Set("Authorization", "Bearer "+rawIdToken)
 
-	log.Println("decide: allow " + subClaim.(string))
-	rw.WriteHeader(http.StatusOK)
+	allow := true
+
+	queryParams := req.URL.Query()
+	allowedGroups := queryParams.Get("allowed_groups")
+	allowedEmails := queryParams.Get("allowed_emails")
+
+	if allowedGroups != "" {
+		allow = false
+		for _, group := range strings.Split(allowedGroups, ",") {
+			if contains(group, userGroups) {
+				allow = true
+				info(req, "user in allowed group '"+group+"'")
+			}
+		}
+	}
+
+	if allowedEmails != "" {
+		allow = false
+		for _, email := range strings.Split(allowedEmails, ",") {
+			if userEmail == email {
+				allow = true
+				info(req, "user email in allowed emails")
+				break
+			}
+		}
+	}
+
+	var status int
+	if allow {
+		status = http.StatusOK
+	} else {
+		status = http.StatusForbidden
+	}
+
+	rw.WriteHeader(status)
+	info(req, http.StatusText(status))
 }
 
 func callback(rw http.ResponseWriter, req *http.Request) {
-	_, err := req.Cookie("oidc-auth")
-	if err != nil {
-		log.Println("callback: called with an existing session. 403")
-		rw.WriteHeader(http.StatusForbidden)
-		return
-	}
-
 	state, err := req.Cookie("state")
 	if err != nil {
-		log.Println("callback: no state cookie")
+		infoS(req, "no state cookie", http.StatusBadRequest)
 		rw.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
 	rd, err := req.Cookie("rd")
 	if err != nil {
-		log.Println("callback: no rd cookie")
+		infoS(req, "no rd cookie", http.StatusBadRequest)
 		rw.WriteHeader(http.StatusBadRequest)
 		return
 	}
@@ -209,84 +215,94 @@ func callback(rw http.ResponseWriter, req *http.Request) {
 	queryParams := req.URL.Query()
 
 	if state.Value != queryParams.Get("state") {
-		log.Println("callback: state mismatch")
+		infoS(req, "state mismatch", http.StatusBadRequest)
 		rw.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
 	code := queryParams.Get("code")
 	if code == "" {
-		log.Println("callback: no code")
+		infoS(req, "no code", http.StatusBadRequest)
 		rw.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
 	token, err := config.Exchange(req.Context(), code)
 	if err != nil {
-		log.Println("callback: code exchange failed", err)
+		infoS(req, "code exchange error : "+err.Error(), http.StatusUnauthorized)
 		rw.WriteHeader(http.StatusUnauthorized)
 		return
 	}
 
 	rawIdToken, ok := token.Extra("id_token").(string)
 	if !ok {
-		log.Println("callback: no id_token", err)
+		infoS(req, "no id_token", http.StatusInternalServerError)
 		rw.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
 	_, err = verifier.Verify(req.Context(), rawIdToken)
 	if err != nil {
-		log.Println("callback: invalid token", err)
+		infoS(req, "invalid token : "+err.Error(), http.StatusUnauthorized)
 		rw.WriteHeader(http.StatusUnauthorized)
 		return
 	}
 
-	var nonce [24]byte
-	if _, err := io.ReadFull(rand.Reader, nonce[:]); err != nil {
-		log.Println("callback: rand", err)
-		rw.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-
-	encrypted := secretbox.Seal(nonce[:], []byte(rawIdToken), &nonce, &secret)
-	encoded := make([]byte, base64.URLEncoding.EncodedLen(len(encrypted)))
-	base64.URLEncoding.Encode(encoded, encrypted)
-
 	http.SetCookie(rw, &http.Cookie{
-		Name:     "oidc-auth",
-		Value:    string(encoded),
-		Path:     prefix,
+		Name:     SessionCookieName,
+		Value:    rawIdToken,
 		Expires:  time.Now().Add(time.Hour * 24),
+		Path:     "/",
 		Secure:   true,
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
 	})
 
+	infoS(req, "redirecting to '"+rd.Value+"'", http.StatusFound)
 	http.Redirect(rw, req, rd.Value, http.StatusFound)
 }
 
 func login(rw http.ResponseWriter, req *http.Request) {
-	_, err := req.Cookie("oidc-auth")
-	if err != nil {
-		log.Println("login: called with an existing session. 403")
-		rw.WriteHeader(http.StatusForbidden)
-		return
-	}
-
 	queryParams := req.URL.Query()
 	rd := queryParams.Get("rd")
 	if rd == "" {
-		rw.WriteHeader(http.StatusBadRequest)
-		return
+		host := req.Header.Get("X-Forwarded-Host")
+		proto := req.Header.Get("X-Forwarded-Proto")
+		port := req.Header.Get("X-Forwarded-Port")
+
+		if host != "" {
+			builder := strings.Builder{}
+			if proto == "https" || proto == "http" {
+				builder.WriteString(proto)
+			} else {
+				builder.WriteString("https")
+			}
+
+			builder.WriteString("://")
+			builder.WriteString(host)
+
+			if p, err := strconv.Atoi(port); err != nil && p > 1 && p < 65535 {
+				builder.WriteString(":")
+				builder.WriteString(port)
+			}
+			rd = builder.String()
+		} else {
+			host = req.Host
+			if host == "" {
+				infoS(req, "could not determine the redirect URL", http.StatusBadRequest)
+				rw.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			rd = "https://" + host
+		}
 	}
 
 	stateCookie, err := req.Cookie("state")
-	if err != nil {
+	if err != nil && stateCookie != nil {
 		left := stateCookie.Expires.Sub(time.Now())
 		if left > (time.Minute*9)+time.Second*50 {
-			log.Println("login: another attempt too soon. 401")
-			rw.WriteHeader(http.StatusUnauthorized)
+			infoS(req, "consecutive logins too soon", http.StatusBadRequest)
+			rw.WriteHeader(http.StatusBadGateway)
 			return
 		}
 	}
@@ -300,7 +316,7 @@ func login(rw http.ResponseWriter, req *http.Request) {
 	http.SetCookie(rw, &http.Cookie{
 		Name:     "state",
 		Value:    state,
-		Path:     prefix,
+		Path:     "/",
 		Expires:  time.Now().Add(time.Minute * 10),
 		Secure:   true,
 		HttpOnly: true,
@@ -309,23 +325,24 @@ func login(rw http.ResponseWriter, req *http.Request) {
 	http.SetCookie(rw, &http.Cookie{
 		Name:     "rd",
 		Value:    rd,
-		Path:     prefix,
+		Path:     "/",
 		Expires:  time.Now().Add(time.Minute * 10),
 		Secure:   true,
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
 	})
 
-	clearCookie(rw, "oidc-auth")
+	clearCookie(rw, SessionCookieName)
 
+	infoS(req, "redirecting to authorization server", http.StatusFound)
 	http.Redirect(rw, req, config.AuthCodeURL(state), http.StatusFound)
 }
 
 func clearCookie(rw http.ResponseWriter, name string) {
 	http.SetCookie(rw, &http.Cookie{
 		Name:     name,
+		Path:     "/",
 		Value:    "",
-		Path:     prefix,
 		Expires:  time.Unix(0, 0),
 		HttpOnly: true,
 	})
@@ -341,4 +358,14 @@ func generateRandomState() (string, error) {
 	state := base64.URLEncoding.EncodeToString(b)
 
 	return state, nil
+}
+
+func contains(s string, slice []string) bool {
+	for _, item := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
+
 }
