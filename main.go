@@ -91,10 +91,12 @@ func logout(rw http.ResponseWriter, req *http.Request) {
 }
 
 func info(req *http.Request, message string) {
+	log.Printf("%s - %s %s %s\n", req.Host, req.Method, req.URL.Path, message)
 	log.Printf("%s - %s %s %s\n", req.RemoteAddr, req.Method, req.URL.Path, message)
 }
 
 func infoS(req *http.Request, message string, status int) {
+	log.Printf("%s - %s %s %s - %s\n", req.Host, req.Method, req.URL.Path, message, http.StatusText(status))
 	log.Printf("%s - %s %s %s - %s\n", req.RemoteAddr, req.Method, req.URL.Path, message, http.StatusText(status))
 }
 
