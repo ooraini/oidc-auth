@@ -193,7 +193,7 @@ func decide(rw http.ResponseWriter, req *http.Request) {
 	}
 
 	rw.WriteHeader(status)
-	info(req, http.StatusText(status))
+	infoS(req, userEmail, status)
 }
 
 func callback(rw http.ResponseWriter, req *http.Request) {
