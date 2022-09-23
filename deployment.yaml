@@ -7,7 +7,7 @@ spec:
     spec:
       containers:
         - name: oidc-auth
-          image: oidc-auth:1.14.2
+          image: oidc-auth
           ports:
             - containerPort: 80
               name: http
