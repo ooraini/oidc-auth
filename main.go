@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"github.com/coreos/go-oidc/v3/oidc"
@@ -57,6 +58,15 @@ func main() {
 		log.Fatalln("unable to decode cookie secret", err)
 	}
 
+	if getEnvOrDefault("INSECURE_SKIP_VERIFY", "false") == "true" {
+		t := &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		}
+		http.DefaultClient = &http.Client{Transport: t}
+	}
+
+	scopes := getEnvOrDefault("SCOPES", "openid profile email groups")
+
 	provider, err = oidc.NewProvider(context.Background(), issuer)
 	if err != nil {
 		log.Fatalln("unable to create OIDC provider", err)
@@ -67,7 +77,7 @@ func main() {
 		ClientSecret: getEnvOrDie("CLIENT_SECRET"),
 		Endpoint:     provider.Endpoint(),
 		RedirectURL:  getEnvOrDie("REDIRECT_URL"),
-		Scopes:       []string{oidc.ScopeOpenID, "profile", "email", "groups"},
+		Scopes:       strings.Split(scopes, " "),
 	}
 
 	verifier = provider.Verifier(&oidc.Config{ClientID: config.ClientID})
@@ -92,7 +102,7 @@ func decide(rw http.ResponseWriter, req *http.Request) {
 	sessionCookie, err := req.Cookie("oidc-auth")
 
 	if err != nil {
-		log.Print("decide: no session cookie")
+		log.Println("decide: no session cookie")
 		rw.WriteHeader(http.StatusUnauthorized)
 		return
 	}
@@ -103,7 +113,7 @@ func decide(rw http.ResponseWriter, req *http.Request) {
 	_, err = base64.URLEncoding.Decode(encrypted, encoded)
 
 	if err != nil {
-		log.Print("decide: invalid session cookie", err)
+		log.Println("decide: invalid session cookie", err)
 		clearCookie(rw, "oidc-auth")
 		rw.WriteHeader(http.StatusUnauthorized)
 		return
@@ -113,7 +123,7 @@ func decide(rw http.ResponseWriter, req *http.Request) {
 	copy(decryptNonce[:], encrypted[:24])
 	decrypted, ok := secretbox.Open(nil, encrypted[24:], &decryptNonce, &secret)
 	if !ok {
-		log.Print("decide: unable to decrypt session cookie")
+		log.Println("decide: unable to decrypt session cookie")
 		clearCookie(rw, "oidc-auth")
 		rw.WriteHeader(http.StatusUnauthorized)
 		return
@@ -122,7 +132,7 @@ func decide(rw http.ResponseWriter, req *http.Request) {
 	rawIdToken := string(decrypted)
 	idToken, err := verifier.Verify(req.Context(), rawIdToken)
 	if err != nil {
-		log.Print("decide: invalid token", err)
+		log.Println("decide: invalid token", err)
 		clearCookie(rw, "oidc-auth")
 		rw.WriteHeader(http.StatusUnauthorized)
 		return
@@ -130,15 +140,18 @@ func decide(rw http.ResponseWriter, req *http.Request) {
 
 	var claims map[string]interface{}
 	if err = idToken.Claims(&claims); err != nil {
-		log.Print("decide: no claims", err)
+		log.Println("decide: no claims", err)
 		rw.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
+	subClaim := claims["sub"]
 	nameClaim := claims["name"]
 	emailClaim := claims["email"]
 	preferredUsernameClaim := claims["preferred_username"]
 	groupsClaim := claims["groups"]
+
+	rw.Header().Set("X-Forwarded-Subject", subClaim.(string))
 
 	if name, ok := nameClaim.(string); ok {
 		rw.Header().Set("X-Forwarded-User", name)
@@ -163,73 +176,75 @@ func decide(rw http.ResponseWriter, req *http.Request) {
 	}
 
 	rw.Header().Set("Authorization", "Bearer "+rawIdToken)
+
+	log.Println("decide: allow " + subClaim.(string))
 	rw.WriteHeader(http.StatusOK)
 }
 
 func callback(rw http.ResponseWriter, req *http.Request) {
 	_, err := req.Cookie("oidc-auth")
 	if err != nil {
-		log.Print("callback: called with an existing session. 403")
+		log.Println("callback: called with an existing session. 403")
 		rw.WriteHeader(http.StatusForbidden)
 		return
 	}
 
 	state, err := req.Cookie("state")
 	if err != nil {
-		log.Print("callback: no state cookie")
+		log.Println("callback: no state cookie")
 		rw.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
 	rd, err := req.Cookie("rd")
 	if err != nil {
-		log.Print("callback: no rd cookie")
+		log.Println("callback: no rd cookie")
 		rw.WriteHeader(http.StatusBadRequest)
-		return
-	}
-
-	queryParams := req.URL.Query()
-
-	if state.Value != queryParams.Get("state") {
-		log.Print("callback: state mismatch")
-		rw.WriteHeader(http.StatusBadRequest)
-		return
-	}
-
-	code := queryParams.Get("code")
-	if code == "" {
-		log.Print("callback: no code")
-		rw.WriteHeader(http.StatusBadRequest)
-		return
-	}
-
-	token, err := config.Exchange(req.Context(), code)
-	if err != nil {
-		log.Print("callback: code exchange failed", err)
-		rw.WriteHeader(http.StatusUnauthorized)
-		return
-	}
-
-	rawIdToken, ok := token.Extra("id_token").(string)
-	if !ok {
-		log.Print("callback: no id_token", err)
-		rw.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-
-	_, err = verifier.Verify(req.Context(), rawIdToken)
-	if err != nil {
-		log.Print("callback: invalid token", err)
-		rw.WriteHeader(http.StatusUnauthorized)
 		return
 	}
 
 	clearCookie(rw, "state")
 	clearCookie(rw, "rd")
 
+	queryParams := req.URL.Query()
+
+	if state.Value != queryParams.Get("state") {
+		log.Println("callback: state mismatch")
+		rw.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	code := queryParams.Get("code")
+	if code == "" {
+		log.Println("callback: no code")
+		rw.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	token, err := config.Exchange(req.Context(), code)
+	if err != nil {
+		log.Println("callback: code exchange failed", err)
+		rw.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	rawIdToken, ok := token.Extra("id_token").(string)
+	if !ok {
+		log.Println("callback: no id_token", err)
+		rw.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	_, err = verifier.Verify(req.Context(), rawIdToken)
+	if err != nil {
+		log.Println("callback: invalid token", err)
+		rw.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
 	var nonce [24]byte
 	if _, err := io.ReadFull(rand.Reader, nonce[:]); err != nil {
-		log.Print("callback: rand", err)
+		log.Println("callback: rand", err)
 		rw.WriteHeader(http.StatusInternalServerError)
 		return
 	}
@@ -254,7 +269,7 @@ func callback(rw http.ResponseWriter, req *http.Request) {
 func login(rw http.ResponseWriter, req *http.Request) {
 	_, err := req.Cookie("oidc-auth")
 	if err != nil {
-		log.Print("login: called with an existing session. 403")
+		log.Println("login: called with an existing session. 403")
 		rw.WriteHeader(http.StatusForbidden)
 		return
 	}
@@ -264,6 +279,16 @@ func login(rw http.ResponseWriter, req *http.Request) {
 	if rd == "" {
 		rw.WriteHeader(http.StatusBadRequest)
 		return
+	}
+
+	stateCookie, err := req.Cookie("state")
+	if err != nil {
+		left := stateCookie.Expires.Sub(time.Now())
+		if left > (time.Minute*9)+time.Second*50 {
+			log.Println("login: another attempt too soon. 401")
+			rw.WriteHeader(http.StatusUnauthorized)
+			return
+		}
 	}
 
 	state, err := generateRandomState()
