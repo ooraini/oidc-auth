@@ -5,10 +5,12 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
+	"fmt"
 	"github.com/coreos/go-oidc/v3/oidc"
 	"golang.org/x/oauth2"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -67,7 +69,6 @@ func main() {
 		ClientID:     getEnvOrDie("CLIENT_ID"),
 		ClientSecret: getEnvOrDie("CLIENT_SECRET"),
 		Endpoint:     provider.Endpoint(),
-		RedirectURL:  getEnvOrDie("REDIRECT_URL"),
 		Scopes:       strings.Split(scopes, " "),
 	}
 
@@ -229,7 +230,16 @@ func callback(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	token, err := config.Exchange(req.Context(), code)
+	rdUrl, err := url.Parse(rd.Value)
+	if err != nil {
+		infoS(req, "invalid rd url : "+err.Error(), http.StatusBadRequest)
+		rw.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	redirectUrl := fmt.Sprintf("%s://%s%s/callback", rdUrl.Scheme, rdUrl.Host, prefix)
+
+	token, err := config.Exchange(req.Context(), code, oauth2.SetAuthURLParam("redirect_uri", redirectUrl))
 	if err != nil {
 		infoS(req, "code exchange error : "+err.Error(), http.StatusUnauthorized)
 		rw.WriteHeader(http.StatusUnauthorized)
@@ -315,6 +325,15 @@ func login(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	rdUrl, err := url.Parse(rd)
+	if err != nil {
+		infoS(req, "invalid rd url : "+err.Error(), http.StatusBadRequest)
+		rw.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	redirectUrl := fmt.Sprintf("%s://%s%s/callback", rdUrl.Scheme, rdUrl.Host, prefix)
+
 	http.SetCookie(rw, &http.Cookie{
 		Name:     "state",
 		Value:    state,
@@ -337,7 +356,7 @@ func login(rw http.ResponseWriter, req *http.Request) {
 	clearCookie(rw, SessionCookieName)
 
 	infoS(req, "redirecting to authorization server", http.StatusFound)
-	http.Redirect(rw, req, config.AuthCodeURL(state), http.StatusFound)
+	http.Redirect(rw, req, config.AuthCodeURL(state, oauth2.SetAuthURLParam("redirect_uri", redirectUrl)), http.StatusFound)
 }
 
 func clearCookie(rw http.ResponseWriter, name string) {
