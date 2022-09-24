@@ -93,12 +93,10 @@ func logout(rw http.ResponseWriter, req *http.Request) {
 
 func info(req *http.Request, message string) {
 	log.Printf("%s - %s %s %s\n", req.Host, req.Method, req.URL.Path, message)
-	log.Printf("%s - %s %s %s\n", req.RemoteAddr, req.Method, req.URL.Path, message)
 }
 
 func infoS(req *http.Request, message string, status int) {
 	log.Printf("%s - %s %s %s - %s\n", req.Host, req.Method, req.URL.Path, message, http.StatusText(status))
-	log.Printf("%s - %s %s %s - %s\n", req.RemoteAddr, req.Method, req.URL.Path, message, http.StatusText(status))
 }
 
 func decide(rw http.ResponseWriter, req *http.Request) {
@@ -170,7 +168,7 @@ func decide(rw http.ResponseWriter, req *http.Request) {
 		for _, group := range strings.Split(allowedGroups, ",") {
 			if contains(group, userGroups) {
 				allow = true
-				info(req, "user in allowed group '"+group+"'")
+				info(req, fmt.Sprintf("'%s' in allowed group '"+group+"'", userEmail))
 			}
 		}
 	}
@@ -180,7 +178,7 @@ func decide(rw http.ResponseWriter, req *http.Request) {
 		for _, email := range strings.Split(allowedEmails, ",") {
 			if userEmail == email {
 				allow = true
-				info(req, "user email in allowed emails")
+				info(req, fmt.Sprintf("'%s' email in allowed emails", userEmail))
 				break
 			}
 		}
