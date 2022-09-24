@@ -91,10 +91,6 @@ func logout(rw http.ResponseWriter, req *http.Request) {
 	http.Redirect(rw, req, "/", http.StatusFound)
 }
 
-func info(req *http.Request, message string) {
-	log.Printf("%s - %s %s %s\n", req.Host, req.Method, req.URL.Path, message)
-}
-
 func infoS(req *http.Request, message string, status int) {
 	log.Printf("%s - %s %s %s - %s\n", req.Host, req.Method, req.URL.Path, message, http.StatusText(status))
 }
@@ -157,42 +153,35 @@ func decide(rw http.ResponseWriter, req *http.Request) {
 
 	rw.Header().Set("Authorization", "Bearer "+rawIdToken)
 
-	allow := true
-
 	queryParams := req.URL.Query()
 	allowedGroups := queryParams.Get("allowed_groups")
 	allowedEmails := queryParams.Get("allowed_emails")
 
 	if allowedGroups != "" {
-		allow = false
+		allowed := false
 		for _, group := range strings.Split(allowedGroups, ",") {
 			if contains(group, userGroups) {
-				allow = true
-				info(req, fmt.Sprintf("'%s' in allowed group '"+group+"'", userEmail))
+				allowed = true
+				break
 			}
+		}
+		if !allowed {
+			infoS(req, fmt.Sprintf("user '%s' not in allowed groups", userEmail), http.StatusForbidden)
+			rw.WriteHeader(http.StatusForbidden)
+			return
 		}
 	}
 
 	if allowedEmails != "" {
-		allow = false
-		for _, email := range strings.Split(allowedEmails, ",") {
-			if userEmail == email {
-				allow = true
-				info(req, fmt.Sprintf("'%s' email in allowed emails", userEmail))
-				break
-			}
+		if !contains(userEmail, strings.Split(allowedEmails, ",")) {
+			infoS(req, fmt.Sprintf("user '%s' not in allowed emails", userEmail), http.StatusForbidden)
+			rw.WriteHeader(http.StatusForbidden)
+			return
 		}
 	}
 
-	var status int
-	if allow {
-		status = http.StatusOK
-	} else {
-		status = http.StatusForbidden
-	}
-
-	rw.WriteHeader(status)
-	infoS(req, userEmail, status)
+	rw.WriteHeader(http.StatusOK)
+	infoS(req, userEmail, http.StatusOK)
 }
 
 func callback(rw http.ResponseWriter, req *http.Request) {
