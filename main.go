@@ -79,7 +79,7 @@ func main() {
 	http.HandleFunc(prefix+"/callback", callback)
 	http.HandleFunc(prefix+"/decisions", decide)
 	http.HandleFunc("/", http.NotFound)
-	err = http.ListenAndServe(":"+getEnvOrDefault("PORT", "8080"), nil)
+	err = http.ListenAndServe(":"+getEnvOrDefault("PORT", "80"), nil)
 	if err != nil {
 		log.Fatalln("unable to listen", err)
 	}
