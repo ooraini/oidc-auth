@@ -44,11 +44,6 @@ func getEnvOrDefault(key, fallback string) string {
 }
 
 func main() {
-	var x interface{} = nil
-	s, ok := x.(string)
-	if ok {
-		println(s)
-	}
 	var err error
 	issuer := getEnvOrDie("ISSUER")
 
