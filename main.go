@@ -24,6 +24,7 @@ var (
 	provider *oidc.Provider
 	config   oauth2.Config
 	verifier *oidc.IDTokenVerifier
+	sameSite http.SameSite
 )
 
 func getEnvOrDie(key string) string {
@@ -56,6 +57,17 @@ func main() {
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		}
 		http.DefaultClient = &http.Client{Transport: t}
+	}
+
+	ss := getEnvOrDefault("SAMESITE", "lax")
+	if strings.EqualFold(ss, "lax") {
+		sameSite = http.SameSiteLaxMode
+	} else if strings.EqualFold(ss, "strict") {
+		sameSite = http.SameSiteStrictMode
+	} else if strings.EqualFold(ss, "none") {
+		sameSite = http.SameSiteNoneMode
+	} else {
+		log.Fatalf("SAMESITE '%s' not supported\n", ss)
 	}
 
 	scopes := getEnvOrDefault("SCOPES", "openid profile email groups")
@@ -254,7 +266,7 @@ func callback(rw http.ResponseWriter, req *http.Request) {
 		Path:     "/",
 		Secure:   true,
 		HttpOnly: true,
-		SameSite: http.SameSiteStrictMode,
+		SameSite: sameSite,
 	})
 
 	infoS(req, "redirecting to '"+rd.Value+"'", http.StatusFound)
@@ -328,7 +340,7 @@ func login(rw http.ResponseWriter, req *http.Request) {
 		Expires:  time.Now().Add(time.Minute * 10),
 		Secure:   true,
 		HttpOnly: true,
-		SameSite: http.SameSiteStrictMode,
+		SameSite: sameSite,
 	})
 	http.SetCookie(rw, &http.Cookie{
 		Name:     "rd",
@@ -337,7 +349,7 @@ func login(rw http.ResponseWriter, req *http.Request) {
 		Expires:  time.Now().Add(time.Minute * 10),
 		Secure:   true,
 		HttpOnly: true,
-		SameSite: http.SameSiteStrictMode,
+		SameSite: sameSite,
 	})
 
 	clearCookie(rw, SessionCookieName)
