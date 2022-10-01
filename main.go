@@ -5,8 +5,10 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"github.com/coreos/go-oidc/v3/oidc"
+	"github.com/jmespath/go-jmespath"
 	"golang.org/x/oauth2"
 	"log"
 	"net/http"
@@ -17,14 +19,19 @@ import (
 	"time"
 )
 
-const prefix = "/auth"
-const SessionCookieName = "oidc_auth"
+const (
+	prefix            = "/auth"
+	SessionCookieName = "oidc_auth"
+	headerPrefix      = "HEADER_"
+)
 
 var (
-	provider *oidc.Provider
-	config   oauth2.Config
-	verifier *oidc.IDTokenVerifier
-	sameSite http.SameSite
+	provider        *oidc.Provider
+	config          oauth2.Config
+	verifier        *oidc.IDTokenVerifier
+	sameSite        http.SameSite
+	jmespathHeaders map[string]*jmespath.JMESPath
+	defaultHeaders  string
 )
 
 func getEnvOrDie(key string) string {
@@ -65,6 +72,13 @@ func main() {
 		log.Fatalf("SAMESITE '%s' not supported\n", ss)
 	}
 
+	defaultHeaders = getEnvOrDefault("DEFAULT_HEADERS", "")
+
+	jmespathHeaders, err = loadHeaderExprs()
+	if err != nil {
+		log.Fatalln("unable to load JMESPATH expressions", err)
+	}
+
 	scopes := getEnvOrDefault("SCOPES", "openid profile email groups")
 
 	provider, err = oidc.NewProvider(context.Background(), issuer)
@@ -90,6 +104,28 @@ func main() {
 	if err != nil {
 		log.Fatalln("unable to listen", err)
 	}
+}
+
+func loadHeaderExprs() (map[string]*jmespath.JMESPath, error) {
+	result := map[string]*jmespath.JMESPath{}
+
+	for _, pair := range os.Environ() {
+		prefixedName, value, _ := strings.Cut(pair, "=")
+
+		if strings.HasPrefix(prefixedName, headerPrefix) {
+			name := prefixedName[len(headerPrefix):]
+			compiled, err := jmespath.Compile(value)
+			if err != nil {
+				log.Printf("unable to parse JMESTPATH expression '%s'\n", value)
+				return nil, err
+			} else {
+				result[name] = compiled
+				log.Printf("header '%s' is avalible\n", name)
+			}
+		}
+	}
+
+	return result, nil
 }
 
 func logout(rw http.ResponseWriter, req *http.Request) {
@@ -126,26 +162,12 @@ func decide(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	subClaim := claims["sub"]
-	nameClaim := claims["name"]
 	emailClaim := claims["email"]
-	preferredUsernameClaim := claims["preferred_username"]
 	groupsClaim := claims["groups"]
-
-	rw.Header().Set("X-Auth-Request-Subject", subClaim.(string))
-
-	if name, ok := nameClaim.(string); ok {
-		rw.Header().Set("X-Auth-Request-User", name)
-	}
 
 	userEmail := ""
 	if email, ok := emailClaim.(string); ok {
 		userEmail = email
-		rw.Header().Set("X-Auth-Request-Email", email)
-	}
-
-	if preferredUsername, ok := preferredUsernameClaim.(string); ok {
-		rw.Header().Set("X-Auth-Request-Preferred-Username", preferredUsername)
 	}
 
 	var userGroups []string
@@ -155,14 +177,16 @@ func decide(rw http.ResponseWriter, req *http.Request) {
 				userGroups = append(userGroups, g)
 			}
 		}
-		rw.Header().Set("X-Auth-Request-Groups", strings.Join(userGroups, ","))
 	}
 
-	rw.Header().Set("Authorization", "Bearer "+rawIdToken)
-
 	queryParams := req.URL.Query()
+	headers := queryParams.Get("headers")
 	allowedGroups := queryParams.Get("allowed_groups")
 	allowedEmails := queryParams.Get("allowed_emails")
+
+	if headers == "" {
+		headers = defaultHeaders
+	}
 
 	if allowedGroups != "" {
 		allowed := false
@@ -184,6 +208,35 @@ func decide(rw http.ResponseWriter, req *http.Request) {
 			infoS(req, fmt.Sprintf("user '%s' not in allowed emails", userEmail), http.StatusForbidden)
 			rw.WriteHeader(http.StatusForbidden)
 			return
+		}
+	}
+
+	idTokenJson, err := base64.RawURLEncoding.DecodeString(strings.Split(rawIdToken, ".")[1])
+	if err != nil {
+		infoS(req, "token payload", http.StatusInternalServerError)
+		rw.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	var data map[string]interface{}
+	if json.Unmarshal(idTokenJson, &data) != nil {
+		infoS(req, "unmarshal", http.StatusInternalServerError)
+		rw.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	data["raw"] = rawIdToken
+
+	for _, header := range strings.Split(headers, ",") {
+		expr := jmespathHeaders[header]
+		if expr == nil {
+			continue
+		}
+
+		search, err := expr.Search(data)
+		if err != nil {
+			continue
+		}
+		if result, ok := search.(string); ok {
+			rw.Header().Set(header, result)
 		}
 	}
 
